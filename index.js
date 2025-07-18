@@ -12,14 +12,14 @@ const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_API_ID = process.env.TELEGRAM_API_ID;
 const TELEGRAM_API_HASH = process.env.TELEGRAM_API_HASH;
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_API_ID || !TELEGRAM_API_HASH) {
-  console.error('Missing Telegram API credentials');
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error('Missing TELEGRAM_BOT_TOKEN');
   process.exit(1);
 }
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-// Static ID-to-date mapping for fallback (based on telegram-account-age-estimator)
+// Static ID-to-date mapping for fallback
 const ID_DATE_MAPPING = [
   { id: 1n, date: new Date('2013-08-01') }, // Telegram launched Aug 2013
   { id: 1000000n, date: new Date('2014-01-01') },
@@ -36,7 +36,7 @@ const ID_DATE_MAPPING = [
   { id: 100000000000n, date: new Date('2022-01-01') },
   { id: 200000000000n, date: new Date('2023-01-01') },
   { id: 500000000000n, date: new Date('2024-01-01') },
-  { id: BigInt(Number.MAX_SAFE_INTEGER), date: new Date('2025-01-01') }
+  { id: BigInt(Number.MAX_SAFE_INTEGER), date: new Date('2025-07-18') }
 ];
 
 // Helper function to calculate date range from accuracy
@@ -69,6 +69,7 @@ class TelegramAgeEstimator {
   static estimateFromUserId(userId) {
     try {
       const id = BigInt(userId);
+      const currentDate = new Date('2025-07-18'); // Cap at current date
       for (let i = 0; i < ID_DATE_MAPPING.length - 1; i++) {
         if (id >= ID_DATE_MAPPING[i].id && id < ID_DATE_MAPPING[i + 1].id) {
           const startDate = ID_DATE_MAPPING[i].date;
@@ -77,7 +78,8 @@ class TelegramAgeEstimator {
           const timeRange = endDate.getTime() - startDate.getTime();
           const idDiff = Number(id - ID_DATE_MAPPING[i].id);
           const interpolatedTime = startDate.getTime() + (idDiff / idRange) * timeRange;
-          return new Date(interpolatedTime);
+          const estimatedDate = new Date(interpolatedTime);
+          return estimatedDate > currentDate ? currentDate : estimatedDate;
         }
       }
       return new Date();
@@ -107,7 +109,7 @@ class TelegramAgeEstimator {
     const estimates = [];
     const confidence = { low: 1, medium: 2, high: 3 };
     const userIdEst = this.estimateFromUserId(userId);
-    if (userIdEst) {
+    if (userIdEst && userId !== '0') {
       estimates.push({ 
         date: userIdEst, 
         confidence: confidence.high, 
@@ -186,18 +188,34 @@ app.get('/api/user/:username', async (req, res) => {
 
     // Try Telegram Bot API
     console.log(`Attempting Telegram Bot API for username: ${username}`);
-    let user;
+    let user, photos;
     try {
       user = await bot.getChat(`@${username}`);
-      console.log('Telegram Bot API Response:', JSON.stringify(user, null, 2));
+      console.log('Telegram Bot API Response (getChat):', JSON.stringify(user, null, 2));
+      if (user.id) {
+        photos = await bot.getUserProfilePhotos(user.id);
+        console.log('Telegram Bot API Response (getUserProfilePhotos):', JSON.stringify(photos, null, 2));
+      }
     } catch (error) {
       console.log(`Telegram Bot API failed: ${error.message}`);
       user = null;
     }
 
+    let avatarUrl = '';
+    if (photos && photos.total_count > 0) {
+      const fileId = photos.photos[0][0].file_id;
+      try {
+        const file = await bot.getFile(fileId);
+        avatarUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+        console.log(`Avatar URL: ${avatarUrl}`);
+      } catch (fileError) {
+        console.log(`Failed to get file: ${fileError.message}`);
+      }
+    }
+
     if (user && user.id) {
       const ageEstimate = TelegramAgeEstimator.estimateAccountAge(
-        user.id || '0',
+        user.id.toString(),
         user.username || username
       );
 
@@ -207,14 +225,16 @@ app.get('/api/user/:username', async (req, res) => {
       res.setHeader('X-Powered-By', 'TelegramAgeChecker');
       res.json({
         username: user.username?.replace('@', '') || username,
-        nickname: user.title || user.first_name || '',
-        avatar: user.photo?.big_file_id ? `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${user.photo.big_file_id}` : '',
+        nickname: `${user.first_name || ''} ${user.last_name || ''}`.trim() || '',
+        avatar: avatarUrl,
         followers: user.participant_count || 0,
         total_likes: 0, // Telegram doesn't provide likes
         verified: user.verified || false,
         description: user.description || user.bio || '',
         region: 'Unknown', // Telegram doesn't provide region
         user_id: user.id.toString(),
+        first_name: user.first_name || '',
+        last_name: user.last_name || '',
         estimated_creation_date: formattedDate,
         estimated_creation_date_range: ageEstimate.dateRange,
         account_age: accountAge,
@@ -245,6 +265,8 @@ app.get('/api/user/:username', async (req, res) => {
         description: '',
         region: 'Unknown',
         user_id: '0',
+        first_name: '',
+        last_name: '',
         estimated_creation_date: formattedDate,
         estimated_creation_date_range: ageEstimate.dateRange,
         account_age: accountAge,
@@ -253,7 +275,7 @@ app.get('/api/user/:username', async (req, res) => {
         accuracy_range: ageEstimate.accuracy,
         estimation_details: {
           all_estimates: ageEstimate.allEstimates,
-          note: 'This is an estimated creation date based on username pattern. Actual creation date may vary. This tool is not affiliated with Telegram.'
+          note: 'This is an estimated creation date based on username pattern due to limited data. Actual creation date may vary. This tool is not affiliated with Telegram.'
         }
       });
     }
